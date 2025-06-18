@@ -292,6 +292,8 @@ def load_models(model_path, device):
     return pose_model, keypoint_detector, smplx_model
 
 
+# Video2MotionPipeline 是一个用于将**输入视频转换为SMPL-X参数轨迹（姿态、形状、位移）**的完整运动估计流程类，
+# 适用于虚拟人动画、驱动重建、姿态分析等任务。该管道集成了 人体检测、2D关键点估计、SMPL-X姿态拟合、平滑、可视化与结果保存，
 class Video2MotionPipeline:
     def __init__(
         self,
@@ -299,10 +301,14 @@ class Video2MotionPipeline:
         fitting_steps,
         device,
         kp_mode="vitpose",
-        visualize=True,
-        pad_ratio=0.2,
-        fov=60,
+        visualize=True,  #是否保存可视化视频；
+        pad_ratio=0.2, #图像padding比例，保证人体居中；
+        fov=60,  # 相机视角（60度）；
     ):
+        # self.pose_model        # 姿态回归模型（如 Multi-HMR）
+        # self.keypoint_detector # ViTPose 检测器（2D全身关键点）
+        # self.smplx_model       # SMPL-X参数模型（3D人体网格结构）
+        # self.smplify           # TemporalSMPLify（优化器)
         self.MAX_RESOLUTION = 1280 * 720
         self.device = device
         self.visualize = visualize
@@ -349,6 +355,7 @@ class Video2MotionPipeline:
         target_img_size = self.pose_model.img_size
         patch_size = self.pose_model.patch_size
 
+        # K：3*3相机内参
         K = get_camera_parameters(
             target_img_size, fov=self.fov, p_x=None, p_y=None, device=self.device
         )
@@ -357,6 +364,7 @@ class Video2MotionPipeline:
         bboxes = torch.tensor(bboxes, device=self.device)
         bboxes = bbox_xyxy_to_cxcywh(bboxes, scale=1.5)
 
+        # - 图像裁剪与归一化
         crop_images, crop_annotations = images_crop(
             frames, bboxes, target_size=target_img_size, device=self.device
         )
@@ -368,6 +376,7 @@ class Video2MotionPipeline:
             # Calculate the possible search area for the primary joint (head) based on 2D keypoints
             # pseudo_idx: The index of the search area center after patching
             # max_dist: The maximum radius of the search area
+            # - 推理与关键区域注意力（pseudo_idx）
             pseudo_idx, max_dist = generate_pseudo_idx(
                 keypoints[i],
                 patch_size,
@@ -377,6 +386,7 @@ class Video2MotionPipeline:
             humans = forward_model(
                 self.pose_model, image, K, pseudo_idx=pseudo_idx, max_dist=max_dist
             )
+            # - 选取主人体 & 还原位姿
             target_human = track_by_area(humans, target_img_size)
             target_human = project2origin_img(target_human, crop_annotations[i])
 
@@ -405,7 +415,7 @@ class Video2MotionPipeline:
                 data_chunk["keypoints_2d"][i, :, :2] = one_euro.filter(
                     data_chunk["keypoints_2d"][i, :, :2]
                 )
-
+            # - 使用 SMPLify 时间优化器拟合 SMPL-X
             poses, betas, transl = self.smplify.fit(
                 data_chunk["rotvec"],
                 data_chunk["beta"],
@@ -418,11 +428,13 @@ class Video2MotionPipeline:
 
             # gaussian filter
             with torch.no_grad():
-
+                
+                # - 平滑处理（高斯滤波）
                 poses, betas, transl = smplx_gs_smooth(
                     poses, betas, transl, fps=self.fps
                 )
 
+                # - 前向 SMPL-X 预测，输出 mesh 和位移
                 out = self.smplx_model(
                     poses,
                     betas,
@@ -433,7 +445,6 @@ class Video2MotionPipeline:
                     expression=None,
                     rot6d=False,
                 )
-
                 transl = out["transl_pelvis"].squeeze(1)
                 poses_ = self.smplx_model.convert_standard_pose(poses)
                 smpl_poses_cam_fill[data_chunk["frame_id"]] = poses_.cpu().numpy()
@@ -499,23 +510,57 @@ class Video2MotionPipeline:
 
     def __call__(self, video_path, output_path, is_file_only=False):
         start = time.time()
+
+        # Step 1：读取视频帧
+            # 支持视频缩放、padding；
+            # 提取帧率（fps）、分辨率；
         all_frames, raw_H, raw_W, fps, offset_w, offset_h = load_video(
             video_path, pad_ratio=self.pad_ratio, max_resolution=self.MAX_RESOLUTION
         )
         self.fps = fps
         video_length = len(all_frames)
 
+        # Step 2：构建相机参数
+            # 创建模拟相机内参矩阵 K；
+            # 设定图像中心为主点；
+        # raw_K：3*3相机内参
         raw_K = get_camera_parameters(
             max(raw_H, raw_W), fov=self.fov, p_x=None, p_y=None, device=self.device
         )
         raw_K[..., 0, -1] = raw_W / 2
         raw_K[..., 1, -1] = raw_H / 2
 
+        # Step 3：人体检测 + 跟踪
+            # 利用 ViTPose 检测器进行全视频帧人体检测；
+            # 使用 track_by_area() 方法只保留一个主角的轨迹；
+            # 返回 bbox + 有效帧序列；
+        # 1. bboxes：List[List[float]]
+        #     表示主角色在每一帧图像中的 边界框（bounding box）坐标
+        #     每一项为 [cx, cy, w, h]（中心点坐标 + 宽高）
+        # 2. frame_ids：List[int]
+        #     主角色在视频中出现的帧编号（frame index）
+        #     表示这些 bbox 对应的是 all_frames 中的哪些帧
         bboxes, frame_ids, frames = self.track(all_frames)
+
+        # Step 4：2D 关键点检测
+            # 支持全身/手/脸关键点输出（wholebody）；
         bboxes, keypoints = self.detect_keypoint2d(bboxes, frames)
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Step 5：SMPL-X 姿态拟合（主计算步骤）
+        # ✅ 1. poses: np.ndarray，形状为 [video_length, 55, 3]
+        #     表示 每一帧 SMPL-X 模型的姿态参数（旋转向量表示）
+        #     每一帧包含 55 个关节，每个关节用 3D 旋转向量（Rodrigues）表示
+        # ✅ 2. betas: np.ndarray，形状为 [video_length, 10]
+        #     表示 每一帧的 SMPL-X 形状参数
+        #     共 10 维，编码了体型、胖瘦、性别特征等
+        # ✅ 3. transl: np.ndarray，形状为 [video_length, 3]
+        #     表示 每一帧人体的全局平移（translational offset）
+        #     通常为骨盆中心点相对于相机坐标系的位置
+        # ✅ 4. verts: List[Union[None, List[Tensor]]]，长度 = video_length
+        #     表示 每一帧重建出的 SMPL-X 网格顶点（mesh）
+        #     每一项是一个 Tensor (6890, 3)，即 SMPL-X mesh 顶点坐标
         poses, betas, transl, verts = self.estimate_pose(
             frame_ids, frames, keypoints, bboxes, raw_K, video_length
         )
@@ -528,11 +573,13 @@ class Video2MotionPipeline:
             )
         os.makedirs(output_folder, exist_ok=True)
 
+        # Step 6：结果可视化
         if self.visualize:
             self.save_video(
                 all_frames, frame_ids, bboxes, keypoints, verts, raw_K, output_folder
             )
 
+        # Step 7：保存 SMPL-X 参数文件
         smplx_output_folder = os.path.join(output_folder, "smplx_params")
         os.makedirs(smplx_output_folder, exist_ok=True)
         self.save_results(
@@ -541,6 +588,7 @@ class Video2MotionPipeline:
         duration = time.time() - start
         print(f"{video_path} processing completed, duration: {duration:.2f}s")
 
+        # 即输出 SMPL-X 参数路径，用于驱动动画或进一步建模。
         return smplx_output_folder
 
 
