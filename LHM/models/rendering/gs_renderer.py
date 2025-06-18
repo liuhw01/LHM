@@ -344,7 +344,17 @@ class GaussianModel:
         use_rgb = self.use_rgb
         return GaussianModel(xyz, opacity, rotation, scaling, shs, use_rgb)
 
+# GSLayer 是渲染神经高斯（Gaussian Splatting，简写 GS）的核心模块，负责将 Transformer decoder 的输出映射为高斯模型的属性：
 
+# 位置偏移（offset_xyz）
+
+# 尺度（scaling）
+
+# 旋转（rotation）
+
+# 不透明度（opacity）
+
+# 颜色／球谐系数（SHs）
 class GSLayer(nn.Module):
     """W/O Activation Function"""
 
@@ -469,7 +479,14 @@ class GSLayer(nn.Module):
         ret = {}
         for k in self.attr_dict:
             layer = self.out_layers[k]
-
+            # 对输入特征 x（通常来自 Transformer 输出）分别计算属性向量。
+            # 使用对应激活函数：
+            #     scale：指数或截断指数
+            #     opacity：sigmoid 或固定值
+            #     rotation：单位四元数
+            #     xyz：sigmoid 映射到可控位移范围
+            #     shs：若输出 RGB，用 sigmoid；否则是球谐系数
+            #     汇总为 GaussianAppOutput 对象，便于下游渲染使用。
             v = layer(x)
             if k == "rotation":
                 if self.fix_rotation:
@@ -1084,6 +1101,13 @@ class GS3DRenderer(nn.Module):
 
         return gs_list, cano_gs_list
 
+#     | 参数             | 说明                                         |
+# | -------------- | ------------------------------------------ |
+# | `x`            | `[N, C]`，来自 Transformer 的高斯点 latent 表征     |
+# | `query_points` | `[N, 3]`，每个高斯点的三维位置（一般为 SMPL 驱动点）          |
+# | `x_fine`       | `[N, C]`，可选：更精细的表征，用于融合 coarse + fine（多尺度） |
+# | `smplx_data`   | 可选，包含姿态、变换等人体参数（这里没有使用）                    |
+# | `debug`        | 是否输出调试信息                                   |
     def forward_gs_attr(self, x, query_points, smplx_data, debug=False, x_fine=None):
         """
         x: [N, C] Float[Tensor, "Np Cp"],
@@ -1092,15 +1116,25 @@ class GS3DRenderer(nn.Module):
         device = x.device
         if self.mlp_network_config is not None:
             # x is processed by LayerNorm
+            # 📌 第二步：可选使用 MLP 编码器进行特征解码
+            # 如果配置了 mlp_net，就将输入的 latent 特征进一步映射到目标维度（例如从 768 → 128）
             x = self.mlp_net(x)
             if x_fine is not None:
                 x_fine = self.mlp_net(x_fine)
-
+        
         # NOTE that gs_attr contains offset xyz
+        # 📌 第三步：提取 SMPL 区域约束信息
+            # 从 SMPLX 模型中获取区域标记：
+            # is_constrain_body：是否对身体区域进行约束（如保持紧贴 mesh）
+            # is_hands：是否使用手部（左 + 右）
+            # is_upper_body：是否仅建模上半身
+            # 这些控制逻辑通常用于动画渲染阶段或区域权重设计。
+# 提取 人体各部位的布尔掩码（mask），每一项都是一个张量，通常 shape 为 [N]，表示 N 个 SMPL 点中哪些属于特定部位。
         is_constrain_body = self.smplx_model.is_constrain_body
         is_hands =  self.smplx_model.is_rhand + self.smplx_model.is_lhand 
         is_upper_body = self.smplx_model.is_upper_body
-
+        
+        # 📌 第四步：构造区域约束字典
         constrain_dict=dict(
             is_constrain_body=is_constrain_body,
             is_hands=is_hands,
@@ -1158,10 +1192,10 @@ class GS3DRenderer(nn.Module):
             assert positions is None
             if positions is None:
                 positions, smplx_data = self.get_query_points(smplx_data, device)
-
+            
             with torch.autocast(device_type=device.type, dtype=torch.float32):
                 pcl_embed = self.pcl_embed(positions)
-
+            
             gs_feats = self.decoder_cross_attn_wrapper(
                 pcl_embed, latent_feat, extra_info
             )
@@ -1316,7 +1350,13 @@ class GS3DRenderer(nn.Module):
                     :, vidx : vidx + 1
                 ]  # e.g. body_pose: [1, N_v, 21, 3] -> [1, 1, 21, 3]
         return smpl_data_single_view
-
+        
+    # 输入：
+    #     gs_hidden_features: Transformer 或 MLP 输出的点云特征张量，形状 [batch, num_points, feat_dim]。
+    #     query_points: 每个 Gaussian 对应的位置输入，SMPL生成，形状 [batch, num_points, 3]（可为 None，由内部生成）。
+    #     smplx_data: 包含人体参数（SMPL-X），用于后续点位置变换。
+    #     additional_features: 可选图像特征，以供 decoder 使用。
+    #     debug: 可控制调试行为。
     def forward_gs(
         self,
         gs_hidden_features: Float[Tensor, "B Np Cp"],
@@ -1326,14 +1366,24 @@ class GS3DRenderer(nn.Module):
         debug: bool = False,
         **kwargs,
     ):
-
+        
         batch_size = gs_hidden_features.shape[0]
 
+        # 获取 Gaussian 特征与标准点
+            # 调用 query_latent_feat()：
+            #     若 decoder 未 skip，会融合点位置 embeddings 与图像特征，输出新的 query_gs_features；
+            #     若 skip，则直接使用 gs_hidden_features；
+            #     同时会更新 query_points（位置）和 smplx_data（带 transform_mat_neutral_pose）。
         # obtain gs_features embedding, cur points position, and also smplx params
         query_gs_features, query_points, smplx_data = self.query_latent_feat(
             query_points, smplx_data, gs_hidden_features, additional_features
         )
 
+        # 初始化输出容器
+        # 用于存储每个 batch element 的 Gaussian 属性（如坐标偏移、透明度、颜色等）。
+        # 按 batch 逐项处理：
+        #     若使用 decoder 输出字典结构（如 coarse + fine），则将它们输入 forward_gs_attr()；
+        #     forward_gs_attr() 调用内部 GSLayer，计算Gaussian属性，返回 GaussianAppOutput（封装属性）。
         gs_attr_list = []
         for b in range(batch_size):
             if isinstance(query_gs_features, dict):
