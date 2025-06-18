@@ -149,6 +149,28 @@ def query_model_config(model_name):
     except:
         return None
 
+# 主要功能：将原始图像处理为：
+#     标准比例
+#     遮罩融合背景
+#     适配网络输入分辨率
+#     输出 shape: [1, 3, H, W]
+# 输出：
+#     rgb: 归一化并处理后的图像张量 [1, 3, H, W]
+#     mask: 与之对应的遮罩 [1, 1, H, W]
+#     intr: 更新后的相机内参（如果输入了）
+# | 参数名               | 类型                     | 说明                                              |
+# | ----------------- | ---------------------- | ----------------------------------------------- |
+# | `rgb_path`        | `str`                  | **原始图像路径**（一般是一张静态的人物照片）                        |
+# | `mask`            | `np.ndarray`           | **前景遮罩图**，shape: `[H, W]`，用于分离人物和背景（值为0\~255）   |
+# | `intr`            | `np.ndarray` or `None` | 相机内参矩阵 `3×3`，用于在缩放图像时同步调整主点 `cx, cy`（可为 `None`） |
+# | `pad_ratio`       | `float`                | 额外的 padding 比例（在此函数未使用）                         |
+# | `bg_color`        | `float or list`        | 替代背景的颜色（如 `1.0` 表示白色，\[1.0, 1.0, 1.0]）          |
+# | `max_tgt_size`    | `int`                  | 中间缩放阶段的最大边长限制（用于 SMPL 模型预处理）                    |
+# | `aspect_standard` | `float`                | 标准图像长宽比（如 `5.0 / 3`），用来决定是否需要添加 padding 以调整比例   |
+# | `enlarge_ratio`   | `list[float]`          | 用于放大人物区域的裁剪比例，例如 `[1.0, 1.0]` 表示不放大             |
+# | `render_tgt_size` | `int`                  | 最终训练图像渲染的目标尺寸（如 224、256），会乘以 `multiply`         |
+# | `multiply`        | `int`                  | 尺寸对齐倍数，例如最终图像尺寸需为 32 的倍数（用于网络兼容性）               |
+# | `need_mask`       | `bool`                 | 是否需要对图像进行掩膜融合（保留人物、背景替换为 `bg_color`）            |
 def infer_preprocess_image(
     rgb_path,
     mask,
@@ -169,21 +191,29 @@ def infer_preprocess_image(
 
     """
 
+    
+    # 1. 读取图像与备份原图
     rgb = np.array(Image.open(rgb_path))
     rgb_raw = rgb.copy()
 
+    # 2. 计算裁剪 BBox
+        # 对输入的 mask 提取前景区域的最小外接矩形（非零区域）。
+        # 返回四个值 [x_min, y_min, x_max, y_max]。
     bbox = get_bbox(mask)
     bbox_list = bbox.get_box()
 
+    # 3. 裁剪 RGB 图像与遮罩
+    # 按照 BBox 裁剪图像与 mask，只保留人物区域，减少背景干扰。
     rgb = rgb[bbox_list[1] : bbox_list[3], bbox_list[0] : bbox_list[2]]
     mask = mask[bbox_list[1] : bbox_list[3], bbox_list[0] : bbox_list[2]]
 
+    # 4. 获取高宽比例并计算缩放尺度
     h, w, _ = rgb.shape
     assert w < h
     cur_ratio = h / w
     scale_ratio = cur_ratio / aspect_standard
 
-
+    # 5. 添加 Padding 补足长宽比
     target_w = int(min(w * scale_ratio, h))
     if target_w - w >0:
         offset_w = (target_w - w) // 2
@@ -219,17 +249,22 @@ def infer_preprocess_image(
             constant_values=0,
         )
 
+    # 6. 归一化图像到 [0, 1]
     rgb = rgb / 255.0  # normalize to [0, 1]
     mask = mask / 255.0
 
+    # 7. 掩膜融合背景色
     mask = (mask > 0.5).astype(np.float32)
     rgb = rgb[:, :, :3] * mask[:, :, None] + bg_color * (1 - mask[:, :, None])
 
+    # 8. 缩放图像到最大输入尺寸
     # resize to specific size require by preprocessor of smplx-estimator.
     rgb = resize_image_keepaspect_np(rgb, max_tgt_size)
     mask = resize_image_keepaspect_np(mask, max_tgt_size)
 
+    # 9. 根据 mask 居中裁剪以放大人物
     # crop image to enlarge human area.
+
     rgb, mask, offset_x, offset_y = center_crop_according_to_mask(
         rgb, mask, aspect_standard, enlarge_ratio
     )
@@ -238,14 +273,20 @@ def infer_preprocess_image(
         intr[1, 2] -= offset_y
 
     # resize to render_tgt_size for training
-
+    # 11. 根据最终训练输入尺寸缩放
+    # 最终将图像缩放至 render_tgt_size，乘以 multiply 保证对齐。
+    # 计算出目标的渲染输入尺寸（H, W），并输出缩放比率 ratio_y, ratio_x，以便后续：
+    #     对图像和 mask 一起缩放
+    #     对相机内参进行等比例缩放（防止变形）
+    #     保证尺寸对齐网络要求（如 UNet、Transformer 等需要 16、32 倍数尺寸）
     tgt_hw_size, ratio_y, ratio_x = calc_new_tgt_size_by_aspect(
-        cur_hw=rgb.shape[:2],
-        aspect_standard=aspect_standard,
-        tgt_size=render_tgt_size,
-        multiply=multiply,
+        cur_hw=rgb.shape[:2],  # 当前图像的高宽
+        aspect_standard=aspect_standard, # 标准长宽比，比如 5/3
+        tgt_size=render_tgt_size, # 最终目标尺寸（短边或长边的目标值
+        multiply=multiply, # 要对齐的倍数，例如 16 或 32
     )
 
+    
     rgb = cv2.resize(
         rgb, dsize=(tgt_hw_size[1], tgt_hw_size[0]), interpolation=cv2.INTER_AREA
     )
@@ -253,6 +294,7 @@ def infer_preprocess_image(
         mask, dsize=(tgt_hw_size[1], tgt_hw_size[0]), interpolation=cv2.INTER_AREA
     )
 
+    # 12. 如果有内参，继续更新缩放与中心
     if intr is not None:
 
         # ******************** Merge *********************** #
@@ -538,6 +580,7 @@ class HumanLRMInferrer(Inferrer):
             need_mask=True,
         )
         try:
+            # 🧑‍🦱 4. 获取人脸图像
             src_head_rgb = self.crop_face_image(image_path)
         except:
             print("w/o head input!")
@@ -668,6 +711,7 @@ class HumanLRMInferrer(Inferrer):
 
 
         try:
+                        # 🧑‍🦱 4. 获取人脸图像
             src_head_rgb = cv2.resize(
                 src_head_rgb,
                 dsize=(self.cfg.src_head_size, self.cfg.src_head_size),
@@ -701,6 +745,9 @@ class HumanLRMInferrer(Inferrer):
         if motion_name in self.motion_dict:
             motion_seq = self.motion_dict[motion_name]
         else:
+            # 🧪 5. 构建 SMPL 参数与运动序列
+                # 加载 SMPL 动作序列和相机轨迹（如某段视频对应的SMPL参数）；
+                # 每一帧动作都包含 smplx_params、render_c2ws（外参）、render_intrs（内参）等。
             motion_seq = prepare_motion_seqs(
                 motion_seqs_dir,
                 motion_img_dir,
@@ -725,6 +772,12 @@ class HumanLRMInferrer(Inferrer):
         self.model.to(dtype)
         smplx_params = motion_seq['smplx_params']
         smplx_params['betas'] = shape_param.to(device)
+
+        
+        # 🎭 6. 调用 infer_single_view 执行静态图像拟合
+        # 模型从单张图像中构建高斯人像模型（可变形 3D Gaussian Splatting）；
+        # 同时获取与SMPL对齐的查询点和标准姿态转换矩阵。
+        # LHM/models/modeling_human_lrm.py
         gs_model_list, query_points, transform_mat_neutral_pose = self.model.infer_single_view(
             image.unsqueeze(0).to(device, dtype),
             src_head_rgb.unsqueeze(0).to(device, dtype),
@@ -740,7 +793,13 @@ class HumanLRMInferrer(Inferrer):
 
         batch_list = [] 
         batch_size = 40  # avoid memeory out!
-
+        
+# 🎞️ 7. 执行动画合成（遍历每个动作帧）
+        # 将 gs_model_list 和 SMPL 动作参数作为输入，执行可变形高斯体渲染，得到每一帧的合成图像；
+        
+        # 输出中含有 comp_rgb（RGB图）、comp_mask（alpha）等；
+        
+        # 多次 batch 推理避免显存溢出。
         for batch_i in range(0, camera_size, batch_size):
             with torch.no_grad():
                 # TODO check device and dtype
@@ -906,6 +965,18 @@ class HumanLRMVideoInferrer(HumanLRMInferrer):
 
     EXP_TYPE: str = "human_lrm_sapdino_bh_sd3_5"
 
+    #     | 参数名                     | 类型                             | 说明                                       |
+    # | ----------------------- | ------------------------------ | ---------------------------------------- |
+    # | `image_path`            | `str`                          | **输入图像路径**（静态人像）                         |
+    # | `motion_seqs_dir`       | `str`                          | 动作参数序列目录（包含每帧的 SMPLX 参数 `.json` 文件）      |
+    # | `motion_img_dir`        | `str`                          | 对应动作帧图像的目录（用于遮罩或对齐）                      |
+    # | `motion_video_read_fps` | `int`                          | 动作帧序列的读取帧率（如 6 FPS）                      |
+    # | `export_video`          | `bool`                         | 是否导出视频（一般为 `True`）                       |
+    # | `export_mesh`           | `bool`                         | 是否导出 mesh（`True` 会调用 `infer_mesh()`）     |
+    # | `dump_tmp_dir`          | `str`                          | 临时中间结果的保存目录（mask、头部图像等）                  |
+    # | `dump_image_dir`        | `str`                          | 最终导出的图像帧目录（每帧渲染结果）                       |
+    # | `dump_video_path`       | `str`                          | 渲染生成的视频文件路径（`.mp4`）                      |
+    # | `shape_param`           | `np.ndarray` or `torch.Tensor` | 可选的人体 shape 参数（通常由 `PoseEstimator` 推理得到） |
     def infer_single(
         self,
         image_path: str,
@@ -918,6 +989,8 @@ class HumanLRMVideoInferrer(HumanLRMInferrer):
         dump_image_dir: str,
         dump_video_path: str,
     ):
+        # 加载配置参数，如图像分辨率、渲染大小、渲染帧率等。
+        # 设置图像的长宽比标准（5:3）。
         source_size = self.cfg.source_size
         render_size = self.cfg.render_size
         # render_views = self.cfg.render_views
@@ -930,13 +1003,16 @@ class HumanLRMVideoInferrer(HumanLRMInferrer):
         motion_img_need_mask = self.cfg.get("motion_img_need_mask", False)  # False
         vis_motion = self.cfg.get("vis_motion", False)  # False
 
+        # 🧍 2. 获取人体 Mask
         parsing_mask = self.parsing(image_path)
 
         save_dir = os.path.join(dump_image_dir, "rgb")
         if os.path.exists(save_dir):
             return
 
+        
         # prepare reference image
+        # 🖼️ 3. 图像预处理（遮罩裁剪、对齐、缩放）
         image, _, _ = infer_preprocess_image(
             image_path,
             mask=parsing_mask,
