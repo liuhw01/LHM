@@ -975,6 +975,15 @@ class GS3DRenderer(nn.Module):
 
         return ret
 
+
+# gs_attr：包含 canonical pose 下 Gaussians 的属性，如 offset_xyz、rotation、scaling、shs。
+
+# query_points：canonical 下 Gaussians 的原始 3D 位置。
+
+# smplx_data：包含 SMPL-X 各部分 pose 信息、transform_mat_neutral_pose 等。
+
+# debug：是否启用 debug 分支。
+
     def animate_gs_model(
         self, gs_attr: GaussianAppOutput, query_points, smplx_data, debug=False
     ):
@@ -983,7 +992,9 @@ class GS3DRenderer(nn.Module):
         """
 
         device = gs_attr.offset_xyz.device
-
+        
+# Debug 模式下，覆盖属性为固定值，用于检查流程。
+        # 作用：构造包含每个视角 pose 和 canonical pose 的变换参数集合，特别是 body_pose 包含两个姿态：当前视角（动画帧）和 neutral pose。
         if debug:
             N = gs_attr.offset_xyz.shape[0]
             gs_attr.xyz = torch.ones_like(gs_attr.offset_xyz) * 0.0
@@ -1030,7 +1041,10 @@ class GS3DRenderer(nn.Module):
         merge_smplx_data["transform_mat_neutral_pose"] = smplx_data[
             "transform_mat_neutral_pose"
         ]
-
+        
+        # 作用：先基于 canonical xyz 加 offset 得到 canonical space Gaussians，
+        # 然后调用 SMPL-X 将它们从 canonical 空间变换到动画 pose 下每个视角。
+        # 这一步返回新的 Gaussians 位置 mean_3d 和对应的位姿变换矩阵。
         with torch.autocast(device_type=device.type, dtype=torch.float32):
             mean_3d = (
                 query_points + gs_attr.offset_xyz
@@ -1048,12 +1062,26 @@ class GS3DRenderer(nn.Module):
             )
 
             # print(mean_3d.shape, transform_mat_neutral_pose.shape, query_points.shape, smplx_data["body_pose"].shape, smplx_data["betas"].shape)
+
+            # 得到不同pose下的mean_3d
+            # transform_to_posed_verts_from_neutral_pose(...) 是 SMPL-X 中的 线性蒙皮变形函数（LBS, Linear Blend Skinning）：
+            #     通过骨骼旋转矩阵将每个点 mean_3d 绑定到对应骨骼。
+            #     然后将点根据目标 pose 的骨骼姿态进行线性变形（权重来自 SMPL）。
+                            #             | 名称             | 来自哪里                        | 作用                              |
+                            # | -------------- | --------------------------- | ------------------------------- |
+                            # | `query_points` | SMPL 网格或规则点                 | 查找“这个点与哪些骨骼有关联”（即 skin weights） |
+                            # | `mean_3d`      | `query_points + offset_xyz` | 表示当前在 canonical pose 下高斯的实际位置   |
+        # 你是用 query_points[i] 来“查表”知道这个点属于哪些骨骼（及其权重）。
+        # 你是用 mean_3d[i]（不是 query point 本身）来变形。
+        # 所以：
+        # query_points 决定“怎么变”
+        # mean_3d 决定“变什么”
             mean_3d, transform_matrix = (
                 self.smplx_model.transform_to_posed_verts_from_neutral_pose(
-                    mean_3d,
-                    merge_smplx_data,
-                    query_points,
-                    transform_mat_neutral_pose=transform_mat_neutral_pose,  # from predefined pose to zero-pose matrix
+                    mean_3d, # 当前点坐标（canonical）
+                    merge_smplx_data,  # 当前帧的 SMPL-X 参数（pose、trans 等） 
+                    query_points,    # 原始顶点位置（skin weight 索引用） 
+                    transform_mat_neutral_pose=transform_mat_neutral_pose,  # from predefined pose to zero-pose matrix  # canonical 的骨架变换
                     device=device,
                 )
             )  # [B, N, 3]
@@ -1062,6 +1090,7 @@ class GS3DRenderer(nn.Module):
             num_view, N, _, _ = transform_matrix.shape
             transform_rotation = transform_matrix[:, :, :3, :3]
 
+            # rigid_rotation_matrix 是由 transform_matrix 提取的动画骨骼的旋转部分，转换为四元数表示。
             rigid_rotation_matrix = torch.nn.functional.normalize(
                 matrix_to_quaternion(transform_rotation), dim=-1
             )
@@ -1070,17 +1099,17 @@ class GS3DRenderer(nn.Module):
             # inference constrain
             is_constrain_body = self.smplx_model.is_constrain_body
             rigid_rotation_matrix[:, is_constrain_body] = I
+            # 🌀 原始旋转（canonical）：
             rotation_neutral_pose = gs_attr.rotation.unsqueeze(0).repeat(num_view, 1, 1)
 
-
+            # 作用：处理 Gaussians 的旋转属性，将 canonical 下原始旋转与变换矩阵中计算出的旋转结合
             # TODO do not move underarm gs
-
             # QUATERNION MULTIPLY
             rotation_pose_verts = quaternion_multiply(
                 rigid_rotation_matrix, rotation_neutral_pose
             )
             # rotation_pose_verts = rotation_neutral_pose
-
+        # 为每个视角生成对应的 GaussianModel，其中包含已转换到动画 pose 下的属性。最后一个视角保留下 canonical pose 版本可用于调试或展示。
         gs_list = []
         cano_gs_list = []
         for i in range(num_view):
@@ -1369,6 +1398,8 @@ class GS3DRenderer(nn.Module):
         
         batch_size = gs_hidden_features.shape[0]
 
+
+        
         # 获取 Gaussian 特征与标准点
             # 调用 query_latent_feat()：
             #     若 decoder 未 skip，会融合点位置 embeddings 与图像特征，输出新的 query_gs_features；
@@ -1418,20 +1449,28 @@ class GS3DRenderer(nn.Module):
         batch_size = len(gs_attr_list)
         out_list = []
         cano_out_list = []  # inference DO NOT use
-
+        
+        # N_view：从 SMPLX 数据获取视角数量（如多个 render_c2ws 对应的数目）。
         N_view = smplx_data["root_pose"].shape[1]
 
         for b in range(batch_size):
+            # 遍历批次中的每一项，取得其对应的高斯属性和 query_points。
             gs_attr = gs_attr_list[b]
             query_pt = query_points[b]
+
             # len(animatable_gs_model_list) = num_view
+            
+            # 调用 animate_gs_model，将高斯属性 + query_points + 当前批次对应的 SMPLX 数据转换为多个航空高斯模型的列表，用于多视角渲染。
+            # 输出：
+            #     merge_animatable_gs_model_list: 列表包含每个视角下的高斯模型。
+            #     cano_gs_model_list: 规范姿态（canonical pose）下的高斯模型（通常用于可视化不渲染）。
             merge_animatable_gs_model_list, cano_gs_model_list = self.animate_gs_model(
                 gs_attr,
                 query_pt,
                 self.get_single_batch_smpl_data(smplx_data, b),
                 debug=debug,
             )
-
+            
             animatable_gs_model_list = merge_animatable_gs_model_list[:N_view]
 
             assert len(animatable_gs_model_list) == c2w.shape[1]
