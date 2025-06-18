@@ -196,6 +196,13 @@ class ModelHumanLRM(nn.Module):
     def hyper_step(self, step):
         pass
 
+    # 🔍 所以如果使用的是默认 "dino" 模型，那么 encoder 实际调用的是：
+        # | encoder\_type | 模型实现路径                                   |
+        # | ------------- | ---------------------------------------- |
+        # | `"dino"`      | `LHM/models/encoders/dino_wrapper.py`    |
+        # | `"dinov2"`    | `LHM/models/encoders/dinov2_wrapper.py`  |
+        # | `"resunet"`   | `LHM/models/encoders/xunet_wrapper.py`   |
+        # | `"sapiens"`   | `LHM/models/encoders/sapiens_warpper.py` |
     @staticmethod
     def _encoder_fn(encoder_type: str):
         encoder_type = encoder_type.lower()
@@ -282,7 +289,9 @@ class ModelHumanLRM(nn.Module):
             mod=camera_embeddings,
         )  # [B, L, D]
         return x
-
+        
+# 输入：一个 [B, 3, H, W] 的图像张量（可能是原始图像或人脸图像）
+# 输出：图像的特征表示 image_feats，用于后续 transformer 编码或高斯构建
     def forward_encode_image(self, image):
         # encode image
 
@@ -323,6 +332,7 @@ class ModelHumanLRM(nn.Module):
 
         # encode image
         # image_feats is cond texture
+        # 一般 shape 为 [B, N_tokens, D]，或 [B, D, H', W'] 取决于 encoder 实现。
         image_feats = self.forward_encode_image(image)
 
         assert (
@@ -433,6 +443,10 @@ class ModelHumanLRM(nn.Module):
 
         self.renderer.hyper_step(step)
 
+    # image: 输入主体图像 [1, 1, 3, H, W]
+    # head_image: 裁剪后的头像图 [1, 1, 3, H, W]
+    # render_c2ws, render_intrs, render_bg_colors: 渲染视角的相机参数和背景
+    # smplx_params: 结构/姿态参数，包括 betas、body_pose 等，用于变形驱动
     @torch.no_grad()
     def infer_single_view(
         self,
@@ -472,11 +486,13 @@ class ModelHumanLRM(nn.Module):
         query_points = None
 
         if self.latent_query_points_type.startswith("e2e_smplx"):
+            # 🎯 获取规范坐标下 SMPL 点云 + 标准姿态变换矩阵
             # obtain subdivide smplx points and transform_matrix from predefined pose to zero-pose (null pose)
             query_points, smplx_params = self.renderer.get_query_points(
                 smplx_params, device=image.device
             )
 
+        # 🧠 提取图像特征 + Transformer 构造高斯隐变量
         # using DiT to predict query points features.
         latent_points, image_feats = self.forward_latent_points(
             image[:, 0], camera=None, query_points=query_points
@@ -769,12 +785,15 @@ class ModelHumanLRMSapdinoBodyHeadSD3_5(ModelHumanLRM):
                 smplx_params, device=image.device
             )
 
+        # latent_points是image_feats+transformer
         latent_points, image_feats = self.forward_latent_points(
             image[:, 0], head_image[:, 0], camera=None, query_points=query_points
         )  # [B, N, C]
 
         self.renderer.hyper_step(10000000)  # set to max step
 
+            # 使用 latent features 和 query_points 构建高斯模型（高斯球体的位置、旋转、颜色、透明度等）
+            # 返回每个样本的 gs_model_list，以及更新后的 smplx_params
         gs_model_list, query_points, smplx_params = self.renderer.forward_gs(
             gs_hidden_features=latent_points,
             query_points=query_points,
@@ -782,7 +801,9 @@ class ModelHumanLRMSapdinoBodyHeadSD3_5(ModelHumanLRM):
             additional_features={"image_feats": image_feats, "image": image[:, 0]},
         )
 
-
+            # gs_model_list: 构建好的高斯人体模型（用于后续动画/渲染）
+            # query_points: SMPL 体表点坐标（标准姿态下）
+            # transform_mat_neutral_pose: 用于从标准姿态映射到当前姿态的变换矩阵
         return gs_model_list, query_points, smplx_params['transform_mat_neutral_pose']
     
 
