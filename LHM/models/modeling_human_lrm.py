@@ -498,6 +498,7 @@ class ModelHumanLRM(nn.Module):
             image[:, 0], camera=None, query_points=query_points
         )  # [B, N, C]
 
+         # canonical pose 下的高斯属性 + 位置
         gs_model_list, query_points, smplx_params = self.renderer.forward_gs(
             gs_hidden_features=latent_points,
             query_points=query_points,
@@ -505,17 +506,19 @@ class ModelHumanLRM(nn.Module):
             additional_features={"image_feats": image_feats, "image": image[:, 0]},
         )
 
+
+        # 第二步：将 canonical 高斯应用动画（即不同 pose）
         # render target views
         render_res_list = []
         for view_idx in range(num_views):
             render_res = self.renderer.forward_animate_gs(
-                gs_model_list,
-                query_points,
-                self.renderer.get_single_view_smpl_data(smplx_params, view_idx),
-                render_c2ws[:, view_idx : view_idx + 1],
-                render_intrs[:, view_idx : view_idx + 1],
-                render_h,
-                render_w,
+                gs_model_list, # ① 高斯模型（每帧或每视角） 由 GSLayer 输出的高斯属性
+                query_points,  # ② 高斯基础三维位置（通常由 SMPL 驱动）  Tensor[B, N, 3]  用途：高斯最终位置 = query_point + offset_xyz，并应用变换。
+                self.renderer.get_single_view_smpl_data(smplx_params, view_idx), # ③ 当前视角的 SMPLX 数据  用于变形或姿态控制，使每帧高斯动画合理。 
+                render_c2ws[:, view_idx : view_idx + 1],  # ④ 当前视角的相机外参 [B, 1, 4, 4] 
+                render_intrs[:, view_idx : view_idx + 1], # ⑤ 当前视角的相机内参 [B, 1, 3, 3] 
+                render_h,  # ⑥ 渲染高度（int） 
+                render_w,  # ⑦ 渲染宽度（int）
                 render_bg_colors[:, view_idx : view_idx + 1],
             )
             render_res_list.append(render_res)
